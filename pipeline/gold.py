@@ -1,118 +1,92 @@
 import pandas as pd
-import psycopg2
+import logging
 from prefect import task, flow
-from rick_and_morty_character_pipeline.config import DB_HOST, DB_NAME, DB_USER, DB_PASSWORD, DB_PORT
-import pandas.io.sql as sql_io # For potential pandas read_sql errors
+from rick_and_morty_character_pipeline.config import SILVER_TABLE_NAME, GOLD_TABLE_NAME
+from rick_and_morty_character_pipeline.utils.db_utils import get_db_connection, create_table, write_dataframe_to_db, read_data_from_db
+
+logger = logging.getLogger(__name__)
 
 @task
-def read_silver_data(table_name: str) -> pd.DataFrame:
-    conn = None
-    df = pd.DataFrame()
+def read_silver_data_gold_task(table_name: str) -> pd.DataFrame:
+    """Reads silver data from PostgreSQL."""
+    logger.info(f"Attempting to read data from silver table: {table_name}")
     try:
-        conn = psycopg2.connect(
-            host=DB_HOST,
-            database=DB_NAME,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            port=DB_PORT
-        )
-        query = f"SELECT * FROM {table_name};"
-        df = pd.read_sql(query, conn)
-        print(f"Read {len(df)} rows from silver_characters.")
-    except (psycopg2.Error, sql_io.DatabaseError) as e: # More specific for database/pandas read_sql errors
-        print(f"Error reading silver data from PostgreSQL: {e}")
+        df = read_data_from_db(table_name)
+        logger.info(f"Successfully read {len(df)} rows from '{table_name}'.")
+        return df
+    except Exception as e:
+        logger.error(f"Error reading silver data from PostgreSQL for gold layer: {e}")
         raise
-    except Exception as e: # Catch any other unexpected errors
-        print(f"An unexpected error occurred while reading silver data: {e}")
-        raise
-    finally:
-        if conn:
-            conn.close()
-    return df
 
 @task
 def prepare_gold_data(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Prepares the gold layer DataFrame by selecting 'id' and 'name'.
+    """
+    logger.info(f"Starting gold data preparation for {len(df)} rows.")
+    if df.empty:
+        logger.warning("Input DataFrame for gold preparation is empty.")
+        return pd.DataFrame()
+
     try:
         # Select only 'id' and 'name' for the gold layer
         gold_df = df[['id', 'name']].copy()
-        print(f"Prepared {len(gold_df)} rows for gold layer.")
+        logger.info(f"Prepared {len(gold_df)} rows for gold layer.")
         return gold_df
-    except KeyError as e: # For missing columns
-        print(f"Missing key during gold data preparation: {e}")
+    except KeyError as e:
+        logger.error(f"Missing key during gold data preparation: {e}")
         raise
-    except pd.errors.DataError as e: # For general pandas data handling errors
-        print(f"Pandas data error during gold data preparation: {e}")
-        raise
-    except Exception as e: # Catch any other unexpected errors
-        print(f"An unexpected error occurred during gold data preparation: {e}")
+    except Exception as e:
+        logger.error(f"An unexpected error occurred during gold data preparation: {e}")
         raise
 
 @task
 def load_gold_data_to_postgres(df: pd.DataFrame, table_name: str):
+    """
+    Loads the prepared gold DataFrame to the PostgreSQL gold table.
+    """
+    if df.empty:
+        logger.warning(f"No data to load to {table_name}. Skipping.")
+        return
+
     conn = None
     try:
-        conn = psycopg2.connect(
-            host=DB_HOST,
-            database=DB_NAME,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            port=DB_PORT
-        )
-        cur = conn.cursor()
+        conn = get_db_connection()
 
-        # Create table if not exists
-        create_table_sql = f"""
-        CREATE TABLE IF NOT EXISTS {table_name} (
-            id BIGINT PRIMARY KEY,
-            name VARCHAR(255)
-        );
+        # Define the schema for the gold_character_names table
+        gold_schema = """
+id BIGINT PRIMARY KEY,
+name VARCHAR(255) NULL
         """
-        cur.execute(create_table_sql)
-        conn.commit()
+        create_table(conn, table_name, gold_schema)
 
-        # Insert data
-        for index, row in df.iterrows():
-            insert_sql = f"""
-            INSERT INTO {table_name} (id, name)
-            VALUES (%s, %s)
-            ON CONFLICT (id) DO UPDATE SET
-                name = EXCLUDED.name;
-            """
-            cur.execute(insert_sql, (
-                row['id'], row['name']
-            ))
-        conn.commit()
-        print(f"Data loaded to {table_name} successfully.")
+        # List of columns that form the primary key for ON CONFLICT
+        conflict_cols = ['id']
 
-    except psycopg2.Error as e: # More specific exception for database errors
-        print(f"Database error loading gold data to PostgreSQL: {e}")
-        if conn:
-            conn.rollback()
-        raise
-    except Exception as e: # Catch any other unexpected errors in load_gold_data_to_postgres
-        print(f"An unexpected error occurred during PostgreSQL loading for gold data: {e}")
-        if conn:
-            conn.rollback()
+        write_dataframe_to_db(conn, df, table_name, conflict_cols)
+        logger.info(f"Data loaded to {table_name} successfully.")
+
+    except Exception as e:
+        logger.error(f"An error occurred during PostgreSQL loading for gold data: {e}")
         raise
     finally:
         if conn:
-            cur.close()
             conn.close()
 
 @flow(name="Rick and Morty Characters Gold Layer")
 def gold_layer_pipeline():
+    """
+    Orchestrates the gold layer data processing.
+    """
+    logger.info("Starting gold layer pipeline.")
     try:
-        silver_df = read_silver_data("silver_characters")
+        silver_df = read_silver_data_gold_task(SILVER_TABLE_NAME)
         gold_df = prepare_gold_data(silver_df)
-        load_gold_data_to_postgres(gold_df, "gold_characters")
-    except (psycopg2.Error, sql_io.DatabaseError) as e: # More specific for database/pandas read_sql errors
-        print(f"Gold layer pipeline failed due to a database/data reading error: {e}")
-        raise
-    except pd.errors.PandasError as e: # Catch various pandas related errors during processing
-        print(f"Gold layer pipeline failed due to a pandas data processing error: {e}")
-        raise
-    except Exception as e: # Catch any other unexpected errors in the flow
-        print(f"Gold layer pipeline failed due to an unexpected error: {e}")
+        load_gold_data_to_postgres(gold_df, GOLD_TABLE_NAME)
+        logger.info("Gold layer pipeline completed successfully.")
+        return gold_df # Return df to enable Prefect to pass it downstream
+    except Exception as e:
+        logger.error(f"Gold layer pipeline failed: {e}")
         raise
 
 if __name__ == "__main__":
