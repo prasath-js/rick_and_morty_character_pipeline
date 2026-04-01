@@ -1,169 +1,130 @@
 import pandas as pd
-import psycopg2
+import logging
 from prefect import task, flow
-from psycopg2 import sql
-from rick_and_morty_character_pipeline.config import DB_HOST, DB_NAME, DB_USER, DB_PASSWORD, DB_PORT
-import pandas.io.sql as sql_io # For potential pandas read_sql errors
+from rick_and_morty_character_pipeline.config import BRONZE_TABLE_NAME, SILVER_TABLE_NAME
+from rick_and_morty_character_pipeline.utils.db_utils import get_db_connection, create_table, write_dataframe_to_db, read_data_from_db
+
+logger = logging.getLogger(__name__)
 
 @task
-def read_bronze_data(table_name: str) -> pd.DataFrame:
-    conn = None
-    df = pd.DataFrame()
+def read_bronze_data_silver_task(table_name: str) -> pd.DataFrame:
+    """Reads bronze data from PostgreSQL."""
+    logger.info(f"Attempting to read data from bronze table: {table_name}")
     try:
-        conn = psycopg2.connect(
-            host=DB_HOST,
-            database=DB_NAME,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            port=DB_PORT
-        )
-        query = f"SELECT * FROM {table_name};"
-        df = pd.read_sql(query, conn)
-        print(f"Read {len(df)} rows from bronze_characters.")
-    except (psycopg2.Error, sql_io.DatabaseError) as e: # More specific for database/pandas read_sql errors
-        print(f"Error reading bronze data from PostgreSQL: {e}")
+        df = read_data_from_db(table_name)
+        logger.info(f"Successfully read {len(df)} rows from '{table_name}'.")
+        return df
+    except Exception as e:
+        logger.error(f"Error reading bronze data from PostgreSQL for silver layer: {e}")
         raise
-    except Exception as e: # Catch any other unexpected errors
-        print(f"An unexpected error occurred while reading bronze data: {e}")
-        raise
-    finally:
-        if conn:
-            conn.close()
-    return df
 
 @task
 def clean_and_flatten_to_silver(df: pd.DataFrame) -> pd.DataFrame:
-    try:
-        # Handle empty strings and convert to NaN where appropriate
-        df = df.replace(r'^\s*$', pd.NA, regex=True)
+    """
+    Cleans, flattens, and transforms bronze data into a silver layer DataFrame.
+    Handles 'origin.url' and 'location.url' and converts pd.NA to None for nullable fields.
+    """
+    logger.info(f"Starting cleaning and flattening for {len(df)} rows.")
+    if df.empty:
+        logger.warning("Input DataFrame for cleaning is empty.")
+        return pd.DataFrame()
 
-        # Flatten nested JSON fields
+    try:
+        # Handle empty strings and convert to NaN where appropriate for object columns
+        for col in df.select_dtypes(include='object').columns:
+            df[col] = df[col].replace(r'^\s*$', pd.NA, regex=True)
+
+        # Flatten nested JSON fields and extract URLs
         df['origin_name'] = df['origin'].apply(lambda x: x.get('name') if isinstance(x, dict) else pd.NA)
+        df['origin_url'] = df['origin'].apply(lambda x: x.get('url') if isinstance(x, dict) else pd.NA)
         df['location_name'] = df['location'].apply(lambda x: x.get('name') if isinstance(x, dict) else pd.NA)
+        df['location_url'] = df['location'].apply(lambda x: x.get('url') if isinstance(x, dict) else pd.NA)
 
         # Drop original nested columns
         df = df.drop(columns=['origin', 'location'], errors='ignore')
 
-        # Type casting
+        # Type casting and conversion of pd.NA to None for database compatibility
         df['id'] = pd.to_numeric(df['id'], errors='coerce').astype('Int64')
-        df['name'] = df['name'].astype(str)
-        df['status'] = df['status'].astype(str)
-        df['species'] = df['species'].astype(str)
-        df['type'] = df['type'].astype(str).replace('<NA>', 'Unknown') # Replace pandas NA string representation
-        df['gender'] = df['gender'].astype(str)
-        df['image'] = df['image'].astype(str)
-        df['url'] = df['url'].astype(str)
-        df['created'] = pd.to_datetime(df['created'], errors='coerce')
-        df['episode'] = df['episode'].apply(lambda x: [str(item) for item in x] if isinstance(x, list) else []) # Ensure episode elements are strings
+        df['name'] = df['name'].astype(str).replace({pd.NA: None, 'nan': None}) # .replace('nan', None) for string 'nan'
+        df['status'] = df['status'].astype(str).replace({pd.NA: None, 'nan': None})
+        df['species'] = df['species'].astype(str).replace({pd.NA: None, 'nan': None})
+        df['type'] = df['type'].astype(str).replace({pd.NA: None, 'nan': None}) # Convert to None instead of 'Unknown'
+        df['gender'] = df['gender'].astype(str).replace({pd.NA: None, 'nan': None})
+        df['image'] = df['image'].astype(str).replace({pd.NA: None, 'nan': None})
+        df['url'] = df['url'].astype(str).replace({pd.NA: None, 'nan': None})
+        df['created'] = pd.to_datetime(df['created'], errors='coerce') # NaT will be converted to None by db_utils
+        df['episode'] = df['episode'].apply(lambda x: [str(item) for item in x] if isinstance(x, list) else None)
 
-        # Ensure no NaN in critical fields after type casting if possible, or handle them
-        df['name'] = df['name'].fillna('Unknown')
-        df['status'] = df['status'].fillna('Unknown')
-        df['species'] = df['species'].fillna('Unknown')
-        df['gender'] = df['gender'].fillna('Unknown')
-        df['origin_name'] = df['origin_name'].fillna('Unknown')
-        df['location_name'] = df['location_name'].fillna('Unknown')
+        df['origin_name'] = df['origin_name'].astype(str).replace({pd.NA: None, 'nan': None})
+        df['origin_url'] = df['origin_url'].astype(str).replace({pd.NA: None, 'nan': None})
+        df['location_name'] = df['location_name'].astype(str).replace({pd.NA: None, 'nan': None})
+        df['location_url'] = df['location_url'].astype(str).replace({pd.NA: None, 'nan': None})
 
-        print(f"Cleaned and flattened {len(df)} rows for silver layer.")
+        logger.info(f"Cleaned and flattened {len(df)} rows for silver layer.")
         return df
-    except pd.errors.DataError as e: # For general pandas data handling errors
-        print(f"Pandas data error during cleaning and flattening: {e}")
-        raise
-    except KeyError as e: # For missing columns
-        print(f"Missing key during cleaning and flattening: {e}")
-        raise
-    except Exception as e: # Catch any other unexpected errors
-        print(f"An unexpected error occurred during cleaning and flattening: {e}")
+    except Exception as e:
+        logger.error(f"An error occurred during cleaning and flattening for silver layer: {e}")
         raise
 
 @task
 def load_silver_data_to_postgres(df: pd.DataFrame, table_name: str):
+    """
+    Loads the cleaned and flattened DataFrame to the PostgreSQL silver table.
+    """
+    if df.empty:
+        logger.warning(f"No data to load to {table_name}. Skipping.")
+        return
+
     conn = None
     try:
-        conn = psycopg2.connect(
-            host=DB_HOST,
-            database=DB_NAME,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            port=DB_PORT
-        )
-        cur = conn.cursor()
+        conn = get_db_connection()
 
-        # Create table if not exists
-        create_table_sql = f"""
-        CREATE TABLE IF NOT EXISTS {table_name} (
-            id BIGINT PRIMARY KEY,
-            name VARCHAR(255),
-            status VARCHAR(50),
-            species VARCHAR(255),
-            type VARCHAR(255),
-            gender VARCHAR(50),
-            origin_name VARCHAR(255),
-            location_name VARCHAR(255),
-            image VARCHAR(255),
-            episode TEXT[],
-            url VARCHAR(255),
-            created TIMESTAMP
-        );
+        # Define the schema for the silver_characters table including new URL fields and NULLable columns
+        silver_schema = """
+id BIGINT PRIMARY KEY,
+name VARCHAR(255) NULL,
+status VARCHAR(50) NULL,
+species VARCHAR(255) NULL,
+type VARCHAR(255) NULL,
+gender VARCHAR(50) NULL,
+origin_name VARCHAR(255) NULL,
+origin_url VARCHAR(255) NULL,
+location_name VARCHAR(255) NULL,
+location_url VARCHAR(255) NULL,
+image VARCHAR(255) NULL,
+episode TEXT[] NULL,
+url VARCHAR(255) NULL,
+created TIMESTAMP NULL
         """
-        cur.execute(create_table_sql)
-        conn.commit()
+        create_table(conn, table_name, silver_schema)
 
-        # Insert data
-        for index, row in df.iterrows():
-            insert_sql = f"""
-            INSERT INTO {table_name} (id, name, status, species, type, gender, origin_name, location_name, image, episode, url, created)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (id) DO UPDATE SET
-                name = EXCLUDED.name,
-                status = EXCLUDED.status,
-                species = EXCLUDED.species,
-                type = EXCLUDED.type,
-                gender = EXCLUDED.gender,
-                origin_name = EXCLUDED.origin_name,
-                location_name = EXCLUDED.location_name,
-                image = EXCLUDED.image,
-                episode = EXCLUDED.episode,
-                url = EXCLUDED.url,
-                created = EXCLUDED.created;
-            """
-            cur.execute(insert_sql, (
-                row['id'], row['name'], row['status'], row['species'], row['type'],
-                row['gender'], row['origin_name'], row['location_name'], row['image'],
-                row['episode'], row['url'], row['created']
-            ))
-        conn.commit()
-        print(f"Data loaded to {table_name} successfully.")
+        # List of columns that form the primary key for ON CONFLICT
+        conflict_cols = ['id']
 
-    except psycopg2.Error as e: # More specific exception for database errors
-        print(f"Database error loading silver data to PostgreSQL: {e}")
-        if conn:
-            conn.rollback()
-        raise
-    except Exception as e: # Catch any other unexpected errors in load_silver_data_to_postgres
-        print(f"An unexpected error occurred during PostgreSQL loading for silver data: {e}")
-        if conn:
-            conn.rollback()
+        write_dataframe_to_db(conn, df, table_name, conflict_cols)
+        logger.info(f"Data loaded to {table_name} successfully.")
+
+    except Exception as e:
+        logger.error(f"An error occurred during PostgreSQL loading for silver data: {e}")
         raise
     finally:
         if conn:
-            cur.close()
             conn.close()
 
 @flow(name="Rick and Morty Characters Silver Layer")
 def silver_layer_pipeline():
+    """
+    Orchestrates the silver layer data processing.
+    """
+    logger.info("Starting silver layer pipeline.")
     try:
-        bronze_df = read_bronze_data("bronze_characters")
+        bronze_df = read_bronze_data_silver_task(BRONZE_TABLE_NAME)
         silver_df = clean_and_flatten_to_silver(bronze_df)
-        load_silver_data_to_postgres(silver_df, "silver_characters")
-    except (psycopg2.Error, sql_io.DatabaseError) as e: # More specific for database/pandas read_sql errors
-        print(f"Silver layer pipeline failed due to a database/data reading error: {e}")
-        raise
-    except pd.errors.PandasError as e: # Catch various pandas related errors during processing
-        print(f"Silver layer pipeline failed due to a pandas data processing error: {e}")
-        raise
-    except Exception as e: # Catch any other unexpected errors in the flow
-        print(f"Silver layer pipeline failed due to an unexpected error: {e}")
+        load_silver_data_to_postgres(silver_df, SILVER_TABLE_NAME)
+        logger.info("Silver layer pipeline completed successfully.")
+        return silver_df # Return df to enable Prefect to pass it downstream
+    except Exception as e:
+        logger.error(f"Silver layer pipeline failed: {e}")
         raise
 
 if __name__ == "__main__":
