@@ -39,15 +39,15 @@ This project implements a data pipeline to extract character information from th
 4.  **Set up PostgreSQL:**
     *   Ensure you have a PostgreSQL server running.
     *   Create a database (e.g., `rickandmorty_db`).
-    *   **Update `config.py`**: Modify the `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_HOST`, `POSTGRES_PORT`, and `POSTGRES_DB` variables to match your PostgreSQL setup. Alternatively, set these as environment variables.
+    *   **Update `config.py`**: Modify the `DB_USER`, `DB_PASSWORD`, `DB_HOST`, `DB_PORT`, and `DB_NAME` variables to match your PostgreSQL setup. Alternatively, set these as environment variables.
 
     Example environment variables:
     ```bash
-    export POSTGRES_USER=myuser
-    export POSTGRES_PASSWORD=mypassword
-    export POSTGRES_HOST=localhost
-    export POSTGRES_PORT=5432
-    export POSTGRES_DB=rickandmorty_db
+    export DB_USER=myuser
+    export DB_PASSWORD=mypassword
+    export DB_HOST=localhost
+    export DB_PORT=5432
+    export DB_NAME=rickandmorty_db
     ```
 
 ## How to Run the Pipeline
@@ -84,6 +84,8 @@ rick_and_morty_character_pipeline/
 │   └── silver.py         # Data cleaning and transformation logic
 ├── config.py             # Configuration settings and constants
 ├── main.py               # Main pipeline runner
+├── orchestration/
+│   └── flows.py          # Prefect flow definitions
 ├── README.md             # Project documentation
 └── requirements.txt      # Python dependencies
 ```
